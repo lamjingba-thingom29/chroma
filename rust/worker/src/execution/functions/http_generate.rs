@@ -14,6 +14,7 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const POLL_INITIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const POLL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+const COMMIT_COLLECTIONS: &[&str] = &["chroma_commits", "hosted_chroma_commits"];
 
 #[derive(Debug, Serialize)]
 struct GenerateRecord {
@@ -36,7 +37,7 @@ struct GenerateRecordSet {
 
 #[derive(Debug, Serialize)]
 struct GenerateRequest {
-    record_set: GenerateRecordSet,
+    record_sets: Vec<GenerateRecordSet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +72,8 @@ pub enum HttpGenerateError {
     GenerationFailed(String),
     #[error("Poll timeout after {0:?}")]
     PollTimeout(std::time::Duration),
+    #[error("Unknown source kind for collection: {0}")]
+    UnknownSourceKind(String),
 }
 
 impl ChromaError for HttpGenerateError {
@@ -79,6 +82,7 @@ impl ChromaError for HttpGenerateError {
             HttpGenerateError::MissingParam(_) | HttpGenerateError::MissingEnvVar(_) => {
                 chroma_error::ErrorCodes::InvalidArgument
             }
+            HttpGenerateError::UnknownSourceKind(_) => chroma_error::ErrorCodes::InvalidArgument,
             _ => chroma_error::ErrorCodes::Internal,
         }
     }
@@ -261,6 +265,23 @@ impl HttpGenerateExecutor {
     }
 }
 
+fn source_kind_for_collection_name(
+    collection_name: &str,
+) -> Result<&'static str, HttpGenerateError> {
+    if collection_name.starts_with("slack_") {
+        return Ok("slack");
+    }
+    if collection_name.starts_with("notion_") {
+        return Ok("notion");
+    }
+    if COMMIT_COLLECTIONS.contains(&collection_name) {
+        return Ok("commit");
+    }
+    Err(HttpGenerateError::UnknownSourceKind(
+        collection_name.to_string(),
+    ))
+}
+
 fn metadata_value_to_json(value: &chroma_types::MetadataValue) -> serde_json::Value {
     match value {
         chroma_types::MetadataValue::Bool(b) => serde_json::Value::Bool(*b),
@@ -278,9 +299,11 @@ impl AttachedFunctionExecutor for HttpGenerateExecutor {
         input_batches: Vec<HydratedInputBatch<'_, '_>>,
         _output_reader: Option<&chroma_segment::blockfile_record::RecordSegmentReaderShard<'_>>,
     ) -> Result<Chunk<LogRecord>, Box<dyn ChromaError>> {
-        let mut any_records = false;
+        let mut record_sets = Vec::new();
 
         for batch in &input_batches {
+            let source_kind = source_kind_for_collection_name(&batch.input_collection_name)
+                .map_err(|e| Box::new(e) as Box<dyn ChromaError>)?;
             let mut records = Vec::new();
             for (record, _) in batch.records.iter() {
                 if record.get_operation() == MaterializedLogOperation::DeleteExisting {
@@ -306,40 +329,77 @@ impl AttachedFunctionExecutor for HttpGenerateExecutor {
                 continue;
             }
 
-            any_records = true;
-            let num_records = records.len();
-            let request_body = GenerateRequest {
-                record_set: GenerateRecordSet {
-                    tenant_id: batch.tenant_id.clone(),
-                    database_id: batch.database_id.clone(),
-                    source_collection: batch.input_collection_name.clone(),
-                    source_kind: batch.input_collection_name.clone(),
-                    output_collection: self.output_collection.clone(),
-                    base_collection: None,
-                    records,
-                    completion_offset: batch.completion_offset,
-                },
-            };
-
-            tracing::info!(
-                "[HttpGenerateExecutor] Spawning generation for {} records from input collection {} via {}",
-                num_records,
-                batch.input_collection_name,
-                self.endpoint_url,
-            );
-
-            let call_id = self.spawn_generation(&request_body).await?;
-            tracing::info!(
-                "[HttpGenerateExecutor] Job spawned with call_id={call_id}, polling for completion"
-            );
-
-            self.poll_until_done(&call_id).await?;
+            record_sets.push(GenerateRecordSet {
+                tenant_id: batch.tenant_id.clone(),
+                database_id: batch.database_id.clone(),
+                source_collection: batch.input_collection_name.clone(),
+                source_kind: source_kind.to_string(),
+                output_collection: self.output_collection.clone(),
+                base_collection: None,
+                records,
+                completion_offset: batch.completion_offset,
+            });
         }
 
-        if !any_records {
+        if record_sets.is_empty() {
             tracing::info!("[HttpGenerateExecutor] No non-delete records to process");
+            return Ok(Chunk::new(Arc::from(Vec::<LogRecord>::new())));
         }
+
+        let total_records: usize = record_sets
+            .iter()
+            .map(|record_set| record_set.records.len())
+            .sum();
+        let request_body = GenerateRequest { record_sets };
+
+        tracing::info!(
+            "[HttpGenerateExecutor] Spawning generation for {} record sets / {} records via {}",
+            request_body.record_sets.len(),
+            total_records,
+            self.endpoint_url,
+        );
+
+        let call_id = self.spawn_generation(&request_body).await?;
+        tracing::info!(
+            "[HttpGenerateExecutor] Job spawned with call_id={call_id}, polling for completion"
+        );
+
+        self.poll_until_done(&call_id).await?;
 
         Ok(Chunk::new(Arc::from(Vec::<LogRecord>::new())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_kind_for_collection_name;
+
+    #[test]
+    fn detects_slack_source_kind() {
+        assert_eq!(
+            source_kind_for_collection_name("slack_master").unwrap(),
+            "slack"
+        );
+    }
+
+    #[test]
+    fn detects_notion_source_kind() {
+        assert_eq!(
+            source_kind_for_collection_name("notion_master").unwrap(),
+            "notion"
+        );
+    }
+
+    #[test]
+    fn detects_commit_source_kind() {
+        assert_eq!(
+            source_kind_for_collection_name("chroma_commits").unwrap(),
+            "commit"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_source_kind() {
+        assert!(source_kind_for_collection_name("unknown_source").is_err());
     }
 }

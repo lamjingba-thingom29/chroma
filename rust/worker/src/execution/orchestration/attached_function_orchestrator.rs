@@ -21,13 +21,12 @@ use chroma_system::{
     OrchestratorContext, PanicError, TaskError, TaskMessage, TaskResult,
 };
 use chroma_types::{
-    AttachedFunction, AttachedFunctionUuid, Chunk, CollectionAndSegments, CollectionUuid, JobId,
-    LogRecord, SegmentShard, SegmentShardError,
+    AttachedFunctionUuid, Chunk, CollectionAndSegments, CollectionUuid, JobId, LogRecord,
+    SegmentShard, SegmentShardError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot::{error::RecvError, Sender};
 use tracing::Span;
-use uuid::Uuid;
 
 use crate::execution::{
     operators::{
@@ -51,32 +50,24 @@ use crate::execution::{
             QueueFunctionError, QueueFunctionInput, QueueFunctionOperator, QueueFunctionOutput,
         },
     },
-    orchestration::compact::{CompactionContext, CompactionContextError, ExecutionState},
+    orchestration::{
+        compact::{CompactionContext, CompactionContextError, ExecutionState},
+        function_execution::{
+            FunctionContext, FunctionExecutionProgress, FunctionInputCollectionData,
+        },
+    },
 };
 
 use super::compact::{CollectionCompactInfo, CompactWriters};
 use chroma_types::AdvanceAttachedFunctionError;
 
-#[derive(Debug, Clone)]
-pub struct FunctionContext {
-    pub attached_function_id: AttachedFunctionUuid,
-    pub function_id: Uuid,
-    pub updated_completion_offset: u64,
-    pub input_collection_id: CollectionUuid,
-    pub is_async: bool,
-    pub attached_function: AttachedFunction,
-}
-
 #[derive(Debug)]
 pub struct AttachedFunctionOrchestrator {
-    input_collection_info: CollectionCompactInfo,
+    input_collection_data: Vec<FunctionInputCollectionData>,
     output_context: CompactionContext,
     result_channel: Option<
         Sender<Result<AttachedFunctionOrchestratorResponse, AttachedFunctionOrchestratorError>>,
     >,
-
-    // Store the materialized outputs from DataFetchOrchestrator
-    materialized_log_data: Vec<MaterializeLogOutput>,
 
     // Function context
     function_context: OnceCell<FunctionContext>,
@@ -91,6 +82,8 @@ pub struct AttachedFunctionOrchestrator {
     is_for_backfill: bool,
 
     is_fn_consumer: bool,
+
+    attached_function_id_filter: Option<AttachedFunctionUuid>,
 }
 
 #[derive(Error, Debug)]
@@ -252,32 +245,40 @@ pub enum AttachedFunctionOrchestratorResponse {
 
 impl AttachedFunctionOrchestrator {
     pub fn new(
-        input_collection_info: CollectionCompactInfo,
+        input_collection_data: Vec<FunctionInputCollectionData>,
         output_context: CompactionContext,
         dispatcher: ComponentHandle<Dispatcher>,
-        data_fetch_records: Vec<MaterializeLogOutput>,
+        attached_function_id_filter: Option<AttachedFunctionUuid>,
         is_for_backfill: bool,
         is_fn_consumer: bool,
     ) -> Self {
         let orchestrator_context = OrchestratorContext::new(dispatcher.clone());
 
         AttachedFunctionOrchestrator {
-            input_collection_info,
+            input_collection_data,
             output_context,
             result_channel: None,
-            materialized_log_data: data_fetch_records,
             function_context: OnceCell::new(),
             state: ExecutionState::MaterializeApplyCommitFlush,
             orchestrator_context,
             dispatcher,
             is_for_backfill,
             is_fn_consumer,
+            attached_function_id_filter,
         }
     }
 
     /// Get the input collection info, following the same pattern as CompactionContext
     pub fn get_input_collection_info(&self) -> &CollectionCompactInfo {
-        &self.input_collection_info
+        &self
+            .input_collection_data
+            .first()
+            .expect("AttachedFunctionOrchestrator requires at least one input collection")
+            .collection_info
+    }
+
+    pub fn get_input_collection_data(&self) -> &[FunctionInputCollectionData] {
+        &self.input_collection_data
     }
 
     /// Get the output collection info if it has been set
@@ -368,7 +369,16 @@ impl AttachedFunctionOrchestrator {
         // For async functions, we don't update the completion offset here as they will
         // be processed through a separate queue mechanism
         if !function_context.is_async || self.is_fn_consumer {
-            function_context.updated_completion_offset = collection_info.pulled_log_offset as u64;
+            function_context.input_progress = self
+                .get_input_collection_data()
+                .iter()
+                .map(|input_collection_data| FunctionExecutionProgress {
+                    input_collection_id: input_collection_data.collection_info.collection_id,
+                    updated_completion_offset: input_collection_data
+                        .collection_info
+                        .pulled_log_offset as u64,
+                })
+                .collect();
         }
 
         let materialized_output = materialized_output
@@ -504,6 +514,7 @@ impl Orchestrator for AttachedFunctionOrchestrator {
         ));
         let input = GetAttachedFunctionInput {
             collection_id: collection_info.collection_id,
+            attached_function_id: self.attached_function_id_filter,
         };
         let task = wrap(
             operator,
@@ -579,8 +590,16 @@ impl Handler<TaskResult<GetAttachedFunctionOutput, GetAttachedFunctionOperatorEr
                     .set_function_context(FunctionContext {
                         attached_function_id: attached_function.id,
                         function_id: attached_function.function_id,
-                        updated_completion_offset: attached_function.completion_offset,
-                        input_collection_id: attached_function.input_collection_id,
+                        input_progress: self
+                            .get_input_collection_data()
+                            .iter()
+                            .map(|input_collection_data| FunctionExecutionProgress {
+                                input_collection_id: input_collection_data
+                                    .collection_info
+                                    .collection_id,
+                                updated_completion_offset: attached_function.completion_offset,
+                            })
+                            .collect(),
                         is_async: attached_function.is_async,
                         attached_function: attached_function.clone(),
                     })
@@ -604,7 +623,7 @@ impl Handler<TaskResult<GetAttachedFunctionOutput, GetAttachedFunctionOperatorEr
                             Box::new(QueueFunctionOperator::new(work_queue_client.clone()));
                         let input = QueueFunctionInput::new(
                             attached_function.id,
-                            self.input_collection_info.collection_id,
+                            self.get_input_collection_info().collection_id,
                             attached_function.completion_offset as i64,
                         );
                         let task = wrap(
@@ -649,13 +668,13 @@ impl Handler<TaskResult<GetAttachedFunctionOutput, GetAttachedFunctionOperatorEr
 
                 // Next step: get the output collection segments using the existing GetCollectionAndSegmentsOperator
                 let database_name = match chroma_types::DatabaseName::new(
-                    self.input_collection_info.collection.database.clone(),
+                    self.get_input_collection_info().collection.database.clone(),
                 ) {
                     Some(name) => name,
                     None => {
                         tracing::error!(
                             "Invalid database name in input collection: {}",
-                            self.input_collection_info.collection.database
+                            self.get_input_collection_info().collection.database
                         );
                         self.terminate_with_result(
                             Err(AttachedFunctionOrchestratorError::InvariantViolation(
@@ -886,31 +905,28 @@ impl Handler<TaskResult<CollectionAndSegments, GetCollectionAndSegmentsError>>
             }
         };
 
-        // Get the input collection info to access pulled_log_offset
-        let collection_info = self.get_input_collection_info();
-
-        // Get the input collection's record segment reader
-        // This can be None if the input collection is uninitialized or in rebuild mode
-        let input_record_segment = self
-            .input_collection_info
-            .writers
-            .as_ref()
-            .and_then(|writers| writers.record_reader.clone());
-
         let input = ExecuteAttachedFunctionInput {
-            input_batches: vec![ExecuteAttachedFunctionBatchInput {
-                materialized_logs: self.materialized_log_data.clone(),
-                input_record_segment,
-                input_collection_id: self.input_collection_info.collection_id,
-                input_collection_name: self.input_collection_info.collection.name.clone(),
-                tenant_id: self.input_collection_info.collection.tenant.clone(),
-                database_id: self
-                    .input_collection_info
-                    .collection
-                    .database_id
-                    .to_string(),
-                completion_offset: collection_info.pulled_log_offset as u64,
-            }],
+            input_batches: self
+                .get_input_collection_data()
+                .iter()
+                .map(|input_collection_data| {
+                    let collection_info = &input_collection_data.collection_info;
+                    let input_record_segment = collection_info
+                        .writers
+                        .as_ref()
+                        .and_then(|writers| writers.record_reader.clone());
+
+                    ExecuteAttachedFunctionBatchInput {
+                        materialized_logs: input_collection_data.materialized_log_data.clone(),
+                        input_record_segment,
+                        input_collection_id: collection_info.collection_id,
+                        input_collection_name: collection_info.collection.name.clone(),
+                        tenant_id: collection_info.collection.tenant.clone(),
+                        database_id: collection_info.collection.database_id.to_string(),
+                        completion_offset: collection_info.pulled_log_offset as u64,
+                    }
+                })
+                .collect(),
             output_collection_id: message.collection.collection_id,
             output_record_segment: message.record_segment.clone(),
             blockfile_provider: self.output_context.blockfile_provider.clone(),
